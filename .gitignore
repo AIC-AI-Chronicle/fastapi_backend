@@ -1,1 +1,51 @@
 /aic_venv
+__pycache__/
+**/__pycache__/
+/*.pyc
+*.pyo
+*.pyd
+**/*.pyc
+**/*.pyo
+**/*.pyd
+*.sqlite3
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.db
+*.egg-info/
+dist/
+build/
+.cache/
+*.bak
+# VS Code settings
+.vscode/
+# macOS system files
+.DS_Store
+# Test and coverage folders
+htmlcov/
+.coverage
+.tox/
+# Python packaging
+*.egg
+*.egg-info/
+.eggs/
+# PyInstaller
+*.spec
+# mypy
+.mypy_cache/
+.dmypy.json
+# pytest
+.pytest_cache/
+# pipenv
+Pipfile.lock
+# virtualenv
+venv/
+ENV/
+env/
+# wheel
+*.whl
+# coverage reports
+.coverage.*
