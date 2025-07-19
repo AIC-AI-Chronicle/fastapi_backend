@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import timedelta
 from contextlib import asynccontextmanager
 from schemas import (
@@ -28,6 +29,15 @@ app = FastAPI(
     description="A basic API for the AIC News Agency with authentication and admin functionality.",
     version="1.0.0",
     lifespan=lifespan
+)
+
+# Add CORS middleware to allow all origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allows all headers
 )
 
 @app.get("/")
