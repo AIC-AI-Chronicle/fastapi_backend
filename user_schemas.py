@@ -34,6 +34,7 @@ class UserArticleResponse(BaseModel):
     relevance_score: Optional[float] = None
     tags: Optional[List[str]] = Field(default_factory=list)
     blockchain_info: Optional[BlockchainInfo] = None
+    blockchain_transaction_hash: Optional[str] = None  # Added this field
     
     class Config:
         json_encoders = {

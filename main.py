@@ -498,7 +498,7 @@ async def get_user_articles_endpoint(
                         elif line.startswith("TAGS:"):
                             tags_str = line.replace("TAGS:", "").strip()
                             tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
-                            break
+
             except Exception:
                 pass
             
@@ -520,11 +520,13 @@ async def get_user_articles_endpoint(
             
             # Create blockchain info
             blockchain_info = None
+            blockchain_transaction_hash = article.get("blockchain_transaction_hash")
+            
             if article.get("blockchain_stored"):
                 blockchain_stored_count += 1
                 blockchain_info = BlockchainInfo(
                     stored_on_chain=article.get("blockchain_stored", False),
-                    transaction_hash=article.get("blockchain_transaction_hash"),
+                    transaction_hash=blockchain_transaction_hash,
                     blockchain_article_id=article.get("blockchain_article_id"),
                     network=article.get("blockchain_network", "bsc_testnet"),
                     explorer_url=article.get("blockchain_explorer_url"),
@@ -541,7 +543,8 @@ async def get_user_articles_endpoint(
                 published_at=published_at,
                 relevance_score=relevance_score,
                 tags=tags,
-                blockchain_info=blockchain_info
+                blockchain_info=blockchain_info,
+                blockchain_transaction_hash=blockchain_transaction_hash  # Added this
             ))
         
         # Sort by relevance if interests provided
@@ -631,6 +634,9 @@ async def search_user_articles(
             if published_at and published_at.tzinfo is None:
                 published_at = published_at.replace(tzinfo=timezone.utc)
             
+            # Get blockchain transaction hash
+            blockchain_transaction_hash = article.get("blockchain_transaction_hash")
+            
             search_results.append(UserArticleResponse(
                 id=article["id"],
                 title=title or "Untitled",
@@ -639,7 +645,8 @@ async def search_user_articles(
                 source=article.get("source", "Unknown"),
                 published_at=published_at,
                 relevance_score=article.get("relevance_score", 0.0),
-                tags=tags
+                tags=tags,
+                blockchain_transaction_hash=blockchain_transaction_hash  # Added this
             ))
         
         return {
