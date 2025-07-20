@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import timedelta
 from contextlib import asynccontextmanager
@@ -414,6 +414,24 @@ async def get_dashboard_stats_endpoint(current_admin: User = Depends(get_current
 async def admin_protected_route(current_admin: User = Depends(get_current_admin_user)):
     """Protected admin route."""
     return {"message": f"Hello Admin {current_admin.full_name}, welcome to AIC News Agency Admin Panel!"}
+
+@app.get("/admin/pipeline/logs")
+async def get_pipeline_logs(
+    pipeline_id: str = Query(None),
+    limit: int = 100,
+    current_admin: User = Depends(get_current_admin_user)
+):
+    """Get recent pipeline logs. (Admin only)"""
+    async with get_db_connection() as conn:
+        query = "SELECT * FROM agent_logs"
+        params = []
+        if pipeline_id:
+            query += " WHERE pipeline_id = $1"
+            params.append(pipeline_id)
+        query += " ORDER BY created_at DESC LIMIT $2"
+        params.append(limit)
+        logs = await conn.fetch(query, *params)
+        return [dict(log) for log in logs]
 
 if __name__ == "__main__":
     import uvicorn

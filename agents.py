@@ -331,28 +331,16 @@ class NewsAgent:
     async def run_pipeline(self, duration_minutes: int = 30):
         """Run the complete news processing pipeline"""
         if self.is_running:
-            await self.send_update("Pipeline", "Pipeline is already running!")
+            await self.send_update("Pipeline", "Pipeline is already running", {"error": True})
             return
-        
-        # Initialize pipeline
         self.is_running = True
         self.current_pipeline_id = str(uuid.uuid4())
         self.start_time = datetime.now()
         self.current_cycle = 0
         self.total_articles_processed = 0
-        
-        # Create pipeline run record
+
         try:
-            await create_pipeline_run(self.current_pipeline_id, duration_minutes)
-        except Exception as e:
-            await self.send_update("Pipeline", f"Error creating pipeline record: {str(e)}")
-        
-        try:
-            await self.send_update("Pipeline", f"Starting news processing pipeline for {duration_minutes} minutes...", {
-                "pipeline_id": self.current_pipeline_id,
-                "duration_minutes": duration_minutes,
-                "start_time": self.start_time.isoformat()
-            })
+            await self.send_update("Pipeline", "Pipeline started", {"duration_minutes": duration_minutes})
             
             end_time = self.start_time + timedelta(minutes=duration_minutes)
             
@@ -417,6 +405,7 @@ class NewsAgent:
             await update_pipeline_status(self.current_pipeline_id, "ERROR", str(e))
             await self.send_update("Pipeline", f"Pipeline error: {str(e)}", {"status": "ERROR", "error": str(e)})
         finally:
+            await self.send_update("Pipeline", "Pipeline stopped")
             self.is_running = False
             self.current_pipeline_id = None
 

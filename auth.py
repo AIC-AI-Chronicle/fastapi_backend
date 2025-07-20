@@ -9,7 +9,7 @@ from schemas import User, TokenData
 from database import get_user_by_email as db_get_user_by_email
 
 # Configuration
-SECRET_KEY = secrets.token_urlsafe(32) 
+SECRET_KEY = "AIC_NEWS_SUPER_SECRET_KEY_2025" 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 3000000
 
