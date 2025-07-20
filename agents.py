@@ -12,7 +12,8 @@ from langchain.schema import HumanMessage
 import os
 from database import (
     get_db_connection, log_agent_activity, create_pipeline_run, 
-    update_pipeline_status, update_pipeline_progress, save_article_to_db
+    update_pipeline_status, update_pipeline_progress, save_article_to_db,
+    update_article_blockchain_info
 )
 from blockchain_integration import integrate_blockchain_hashing
 
@@ -334,6 +335,7 @@ class NewsAgent:
         if self.is_running:
             await self.send_update("Pipeline", "Pipeline is already running", {"error": True})
             return
+        
         self.is_running = True
         self.current_pipeline_id = str(uuid.uuid4())
         self.start_time = datetime.now()
@@ -341,7 +343,10 @@ class NewsAgent:
         self.total_articles_processed = 0
 
         try:
-            await self.send_update("Pipeline", "Pipeline started", {"duration_minutes": duration_minutes})
+            await self.send_update("Pipeline", f"Pipeline started for {duration_minutes} minutes", {"duration_minutes": duration_minutes})
+            
+            # Create pipeline run record
+            await create_pipeline_run(self.current_pipeline_id, duration_minutes)
             
             end_time = self.start_time + timedelta(minutes=duration_minutes)
             
@@ -367,12 +372,57 @@ class NewsAgent:
                     # Step 4: Generate and save articles
                     final_articles = await self.generate_articles(unbiased_articles)
                     
-                    # Step 5: Store articles on blockchain
+                    # Step 5: Store articles on blockchain and update database
+                    await self.send_update("Pipeline", "Starting blockchain storage process...")
                     blockchain_articles = await integrate_blockchain_hashing(
                         final_articles, 
                         self.current_pipeline_id, 
                         self.websocket_manager
                     )
+                    
+                    # Update each article in database with blockchain information
+                    blockchain_stored_count = 0
+                    for article in blockchain_articles:
+                        if article.get('blockchain_hashes') or article.get('blockchain_stored'):
+                            try:
+                                blockchain_info = {
+                                    'stored_on_chain': article.get('blockchain_stored', False),
+                                    'transaction_hash': article.get('blockchain_transaction', {}).get('transaction_hash'),
+                                    'blockchain_article_id': article.get('blockchain_transaction', {}).get('article_id'),
+                                    'network': article.get('blockchain_network', 'bsc_testnet'),
+                                    'explorer_url': article.get('blockchain_transaction', {}).get('explorer_url'),
+                                    'content_hash': article.get('blockchain_hashes', {}).get('content_hash'),
+                                    'metadata_hash': article.get('blockchain_hashes', {}).get('metadata_hash')
+                                }
+                                
+                                # Update article in database with blockchain info
+                                await update_article_blockchain_info(article.get('id'), blockchain_info)
+                                
+                                if blockchain_info.get('stored_on_chain'):
+                                    blockchain_stored_count += 1
+                                    
+                                    # Log successful blockchain storage
+                                    await log_agent_activity(
+                                        self.current_pipeline_id,
+                                        "Blockchain Storage",
+                                        f"Article {article.get('id')} stored on blockchain with TX: {blockchain_info.get('transaction_hash', '')[:10]}...",
+                                        "INFO",
+                                        {
+                                            "article_id": article.get('id'),
+                                            "blockchain_article_id": blockchain_info.get('blockchain_article_id'),
+                                            "transaction_hash": blockchain_info.get('transaction_hash'),
+                                            "explorer_url": blockchain_info.get('explorer_url'),
+                                            "network": blockchain_info.get('network')
+                                        }
+                                    )
+                                
+                            except Exception as e:
+                                await log_agent_activity(
+                                    self.current_pipeline_id,
+                                    "Blockchain Storage",
+                                    f"Error updating article {article.get('id')} with blockchain info: {str(e)}",
+                                    "ERROR"
+                                )
                     
                     # Update progress
                     try:
@@ -381,13 +431,12 @@ class NewsAgent:
                         await self.send_update("Pipeline", f"Error updating progress: {str(e)}")
                     
                     cycle_time = (datetime.now() - cycle_start).seconds
-                    blockchain_stored = sum(1 for article in blockchain_articles if article.get('blockchain_stored', False))
                     
                     await self.send_update("Pipeline", 
-                                         f"Cycle {self.current_cycle} completed in {cycle_time}s. Processed {len(final_articles)} articles, {blockchain_stored} stored on blockchain", {
+                                         f"Cycle {self.current_cycle} completed in {cycle_time}s. Processed {len(final_articles)} articles, {blockchain_stored_count} stored on blockchain", {
                                              "cycle": self.current_cycle,
                                              "articles_in_cycle": len(final_articles),
-                                             "blockchain_stored": blockchain_stored,
+                                             "blockchain_stored": blockchain_stored_count,
                                              "total_articles": self.total_articles_processed,
                                              "cycle_duration": cycle_time
                                          })
@@ -415,6 +464,12 @@ class NewsAgent:
         except Exception as e:
             await update_pipeline_status(self.current_pipeline_id, "ERROR", str(e))
             await self.send_update("Pipeline", f"Pipeline error: {str(e)}", {"status": "ERROR", "error": str(e)})
+            await log_agent_activity(
+                self.current_pipeline_id,
+                "Pipeline",
+                f"Pipeline error: {str(e)}",
+                "ERROR"
+            )
         finally:
             await self.send_update("Pipeline", "Pipeline stopped")
             self.is_running = False

@@ -306,9 +306,21 @@ class BlockchainHasher:
             
             print(f"🔐 Signing transaction...")
             
-            # Sign and send transaction
+            # Sign transaction
             signed_txn = self.account.sign_transaction(transaction)
-            tx_hash = self.web3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            
+            # Get the raw transaction data - handle both old and new web3 versions
+            raw_transaction = None
+            if hasattr(signed_txn, 'raw_transaction'):
+                raw_transaction = signed_txn.raw_transaction
+            elif hasattr(signed_txn, 'rawTransaction'):
+                raw_transaction = signed_txn.rawTransaction
+            else:
+                # Fallback for very old versions
+                raw_transaction = signed_txn
+            
+            # Send transaction
+            tx_hash = self.web3.eth.send_raw_transaction(raw_transaction)
             
             print(f"📡 Transaction sent: {tx_hash.hex()}")
             print(f"🔗 BSC Testnet Explorer: https://testnet.bscscan.com/tx/{tx_hash.hex()}")
