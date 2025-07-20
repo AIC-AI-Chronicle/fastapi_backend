@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from contextlib import asynccontextmanager
 import os
 import json
@@ -20,10 +20,14 @@ from auth import (
 from database import (
     create_connection_pool, close_connection_pool, init_database,
     create_user, get_user_by_email, get_all_users, update_user_activity,
-    get_db_connection, get_active_pipeline_runs, get_articles, get_dashboard_stats
+    get_db_connection, get_active_pipeline_runs, get_articles, get_dashboard_stats,
+    get_user_articles, search_articles_by_keywords
 )
 from agents import NewsAgent
 from websocket_manager import manager
+from user_schemas import (
+    UserArticleRequest, UserArticleResponse, UserArticlesPageResponse
+)
 
 # Global variables
 news_agent = None
@@ -432,6 +436,257 @@ async def get_pipeline_logs(
         params.append(limit)
         logs = await conn.fetch(query, *params)
         return [dict(log) for log in logs]
+
+# User Articles Endpoints
+@app.post("/user/articles", response_model=UserArticlesPageResponse)
+async def get_user_articles_endpoint(
+    request: UserArticleRequest,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get articles for user based on interests with pagination."""
+    
+    try:
+        # Validate and process date filters
+        date_from = request.date_from
+        date_to = request.date_to
+        
+        # Convert timezone-naive datetimes to UTC if needed
+        if date_from and date_from.tzinfo is None:
+            date_from = date_from.replace(tzinfo=timezone.utc)
+        if date_to and date_to.tzinfo is None:
+            date_to = date_to.replace(tzinfo=timezone.utc)
+        
+        # Validate date range
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="date_from cannot be after date_to"
+            )
+        
+        # Get articles from database
+        result = await get_user_articles(
+            interests=request.interests,
+            page=request.page,
+            page_size=request.page_size,
+            source_filter=request.source_filter,
+            date_from=date_from,
+            date_to=date_to
+        )
+        
+        # Process articles and extract titles/tags from generated content
+        user_articles = []
+        for article in result["articles"]:
+            # Extract title and content from generated_content
+            generated_content = article.get("generated_content", "")
+            title = article.get("original_title", "")
+            content = generated_content
+            tags = []
+            
+            # Try to parse the generated content for better formatting
+            try:
+                if generated_content and "HEADLINE:" in generated_content:
+                    lines = generated_content.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith("HEADLINE:"):
+                            title = line.replace("HEADLINE:", "").strip()
+                        elif line.startswith("TAGS:"):
+                            tags_str = line.replace("TAGS:", "").strip()
+                            tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+                            break
+            except Exception:
+                pass
+            
+            # Calculate relevance score if interests provided
+            relevance_score = None
+            if request.interests:
+                relevance_score = 0.0
+                content_lower = (title + " " + content).lower()
+                matches = 0
+                for interest in request.interests:
+                    if interest.lower() in content_lower:
+                        matches += 1
+                relevance_score = matches / len(request.interests) if request.interests else 0.0
+            
+            # Ensure datetime is timezone-aware
+            published_at = article.get("created_at")
+            if published_at and published_at.tzinfo is None:
+                published_at = published_at.replace(tzinfo=timezone.utc)
+            
+            user_articles.append(UserArticleResponse(
+                id=article["id"],
+                title=title or "Untitled",
+                content=content,
+                source=article.get("source", "Unknown"),
+                published_at=published_at,
+                relevance_score=relevance_score,
+                tags=tags
+            ))
+        
+        # Sort by relevance if interests provided
+        if request.interests and user_articles:
+            user_articles.sort(key=lambda x: x.relevance_score or 0, reverse=True)
+        
+        # Calculate pagination info
+        total_pages = math.ceil(result["total_count"] / request.page_size) if result["total_count"] > 0 else 0
+        has_next = request.page < total_pages
+        has_previous = request.page > 1
+        
+        return UserArticlesPageResponse(
+            articles=user_articles,
+            total_count=result["total_count"],
+            page=request.page,
+            page_size=request.page_size,
+            total_pages=total_pages,
+            has_next=has_next,
+            has_previous=has_previous
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in get_user_articles_endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching articles: {str(e)}"
+        )
+
+@app.get("/user/articles/search")
+async def search_user_articles(
+    q: str = Query(..., description="Search query", min_length=2),
+    limit: int = Query(20, le=100, ge=1, description="Maximum number of articles to return"),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Search articles by keywords for users."""
+    
+    try:
+        # Split search query into keywords and filter valid ones
+        keywords = [keyword.strip() for keyword in q.split() if len(keyword.strip()) >= 2]
+        
+        if not keywords:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No valid search keywords provided (minimum 2 characters per keyword)"
+            )
+        
+        # Search articles
+        articles = await search_articles_by_keywords(keywords, limit)
+        
+        # Process and format articles
+        search_results = []
+        for article in articles:
+            # Extract title from generated content
+            generated_content = article.get("generated_content", "")
+            title = article.get("original_title", "")
+            content = generated_content
+            tags = []
+            
+            # Try to parse the generated content for better formatting
+            try:
+                if generated_content and "HEADLINE:" in generated_content:
+                    lines = generated_content.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith("HEADLINE:"):
+                            title = line.replace("HEADLINE:", "").strip()
+                        elif line.startswith("TAGS:"):
+                            tags_str = line.replace("TAGS:", "").strip()
+                            tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+                            break
+            except Exception:
+                pass
+            
+            # Ensure datetime is timezone-aware
+            published_at = article.get("created_at")
+            if published_at and published_at.tzinfo is None:
+                published_at = published_at.replace(tzinfo=timezone.utc)
+            
+            search_results.append(UserArticleResponse(
+                id=article["id"],
+                title=title or "Untitled",
+                content=content,
+                source=article.get("source", "Unknown"),
+                published_at=published_at,
+                relevance_score=article.get("relevance_score", 0.0),
+                tags=tags
+            ))
+        
+        return {
+            "articles": search_results,
+            "total_found": len(search_results),
+            "search_query": q,
+            "keywords_used": keywords
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in search_user_articles: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error searching articles: {str(e)}"
+        )
+
+@app.get("/user/articles/interests")
+async def get_popular_interests(current_user: User = Depends(get_current_active_user)):
+    """Get popular interests/tags from articles to help users choose."""
+    try:
+        async with get_db_connection() as conn:
+            # Get recent articles and extract common keywords
+            articles = await conn.fetch("""
+                SELECT generated_content 
+                FROM articles 
+                WHERE created_at >= NOW() - INTERVAL '30 days'
+                ORDER BY created_at DESC 
+                LIMIT 100
+            """)
+            
+            # Extract tags from articles
+            all_tags = []
+            
+            for article in articles:
+                content = article.get("generated_content", "")
+                try:
+                    if "TAGS:" in content:
+                        lines = content.split('\n')
+                        for line in lines:
+                            if line.startswith("TAGS:"):
+                                tags_str = line.replace("TAGS:", "").strip()
+                                tags = [tag.strip().lower() for tag in tags_str.split(',') if tag.strip()]
+                                all_tags.extend(tags)
+                                break
+                except Exception:
+                    continue
+            
+            # Count tag frequency
+            from collections import Counter
+            tag_counter = Counter(all_tags)
+            popular_tags = [tag for tag, count in tag_counter.most_common(20) if count > 1]
+            
+            # Add some default popular interests
+            default_interests = [
+                "technology", "politics", "sports", "health", "business", 
+                "science", "entertainment", "world news", "economy", "climate"
+            ]
+            
+            # Combine and deduplicate
+            all_interests = list(set(popular_tags + default_interests))[:30]
+            
+            return {
+                "popular_interests": all_interests,
+                "total_articles_analyzed": len(articles),
+                "suggestion": "Select interests that match your preferences to get personalized article recommendations"
+            }
+    
+    except Exception as e:
+        return {
+            "popular_interests": [
+                "technology", "politics", "sports", "health", "business", 
+                "science", "entertainment", "world news", "economy", "climate"
+            ],
+            "total_articles_analyzed": 0,
+            "suggestion": "Select interests that match your preferences to get personalized article recommendations"
+        }
 
 if __name__ == "__main__":
     import uvicorn

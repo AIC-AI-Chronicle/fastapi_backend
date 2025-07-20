@@ -1,8 +1,9 @@
+import json
+from typing import Optional, List
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import asyncpg
 import os
-import json
-from typing import Optional
-from contextlib import asynccontextmanager
 
 # Database configuration
 DATABASE_CONFIG = {
@@ -293,4 +294,126 @@ async def get_dashboard_stats():
             "total_articles": total_articles,
             "articles_today": articles_today,
             "running_pipelines": running_pipelines
+        }
+
+async def search_articles_by_keywords(keywords: List[str], limit: int = 50):
+    """Search articles by keywords for relevance scoring"""
+    async with get_db_connection() as conn:
+        if not keywords:
+            return []
+            
+        # Create search conditions with proper parameter handling
+        search_conditions = []
+        params = []
+        
+        for i, keyword in enumerate(keywords):
+            # Each keyword gets two parameters (for title and content search)
+            title_param = f"${len(params) + 1}"
+            content_param = f"${len(params) + 2}"
+            
+            search_conditions.append(f"(original_title ILIKE {title_param} OR generated_content ILIKE {content_param})")
+            params.append(f"%{keyword}%")
+            params.append(f"%{keyword}%")
+        
+        if not search_conditions:
+            return []
+            
+        # Add limit parameter
+        limit_param = f"${len(params) + 1}"
+        params.append(limit)
+        
+        query = f"""
+            SELECT id, original_title, generated_content, source, created_at,
+                   1.0 as relevance_score
+            FROM articles 
+            WHERE {' OR '.join(search_conditions)}
+            ORDER BY created_at DESC
+            LIMIT {limit_param}
+        """
+        
+        articles = await conn.fetch(query, *params)
+        return [dict(article) for article in articles]
+
+async def get_user_articles(interests: List[str] = None, page: int = 1, page_size: int = 10, 
+                           source_filter: str = None, date_from: datetime = None, 
+                           date_to: datetime = None):
+    """Get articles for users with filtering and pagination"""
+    async with get_db_connection() as conn:
+        # Build the WHERE clause based on filters
+        where_conditions = []
+        params = []
+        
+        # Convert datetime objects to timezone-aware if they're naive
+        if date_from:
+            if date_from.tzinfo is None:
+                date_from = date_from.replace(tzinfo=timezone.utc)
+            where_conditions.append(f"created_at >= ${len(params) + 1}")
+            params.append(date_from)
+            
+        if date_to:
+            if date_to.tzinfo is None:
+                date_to = date_to.replace(tzinfo=timezone.utc)
+            where_conditions.append(f"created_at <= ${len(params) + 1}")
+            params.append(date_to)
+            
+        # Source filter
+        if source_filter:
+            where_conditions.append(f"source ILIKE ${len(params) + 1}")
+            params.append(f"%{source_filter}%")
+            
+        # Interest-based filtering using full-text search
+        if interests and len(interests) > 0:
+            interest_conditions = []
+            for interest in interests:
+                title_param = f"${len(params) + 1}"
+                content_param = f"${len(params) + 2}"
+                interest_conditions.append(f"(original_title ILIKE {title_param} OR generated_content ILIKE {content_param})")
+                params.append(f"%{interest}%")
+                params.append(f"%{interest}%")
+            
+            if interest_conditions:
+                where_conditions.append(f"({' OR '.join(interest_conditions)})")
+        
+        # Build WHERE clause
+        where_clause = ""
+        if where_conditions:
+            where_clause = "WHERE " + " AND ".join(where_conditions)
+        
+        # Get total count
+        count_query = f"SELECT COUNT(*) FROM articles {where_clause}"
+        try:
+            if params:
+                total_count = await conn.fetchval(count_query, *params)
+            else:
+                total_count = await conn.fetchval(count_query)
+            total_count = total_count or 0
+        except Exception as e:
+            print(f"Error getting count: {e}")
+            total_count = 0
+        
+        # Calculate pagination
+        offset = (page - 1) * page_size
+        limit_param = f"${len(params) + 1}"
+        offset_param = f"${len(params) + 2}"
+        
+        # Get articles with pagination
+        articles_query = f"""
+            SELECT id, original_title, generated_content, source, created_at, processed_at
+            FROM articles 
+            {where_clause}
+            ORDER BY created_at DESC 
+            LIMIT {limit_param} OFFSET {offset_param}
+        """
+        
+        try:
+            articles = await conn.fetch(articles_query, *params, page_size, offset)
+        except Exception as e:
+            print(f"Error fetching articles: {e}")
+            articles = []
+        
+        return {
+            "articles": [dict(article) for article in articles],
+            "total_count": total_count,
+            "page": page,
+            "page_size": page_size
         }
