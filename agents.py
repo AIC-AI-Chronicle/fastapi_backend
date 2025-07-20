@@ -1,18 +1,19 @@
 import asyncio
 import json
+import uuid
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import aiohttp
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from langchain.agents import AgentExecutor, create_openai_functions_agent
-from langchain.tools import Tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import SystemMessage, HumanMessage
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.schema import HumanMessage
 import os
-from database import get_db_connection
+from database import (
+    get_db_connection, log_agent_activity, create_pipeline_run, 
+    update_pipeline_status, update_pipeline_progress, save_article_to_db
+)
 
 class NewsAgent:
     def __init__(self, gemini_api_key: str, websocket_manager):
@@ -23,6 +24,10 @@ class NewsAgent:
         )
         self.websocket_manager = websocket_manager
         self.is_running = False
+        self.current_pipeline_id = None
+        self.start_time = None
+        self.current_cycle = 0
+        self.total_articles_processed = 0
         
         # News sources
         self.news_sources = [
@@ -33,14 +38,35 @@ class NewsAgent:
         ]
 
     async def send_update(self, agent_name: str, message: str, data: Optional[Dict] = None):
-        """Send real-time update via WebSocket"""
+        """Send real-time update via WebSocket and log to database"""
         update = {
             "agent": agent_name,
             "message": message,
             "timestamp": datetime.now().isoformat(),
-            "data": data
+            "pipeline_id": self.current_pipeline_id,
+            "cycle": self.current_cycle,
+            "data": data or {}
         }
-        await self.websocket_manager.broadcast(json.dumps(update))
+        
+        # Send WebSocket update
+        try:
+            await self.websocket_manager.broadcast(json.dumps(update))
+        except Exception as e:
+            print(f"WebSocket broadcast error: {e}")
+        
+        # Log to database with proper data handling
+        if self.current_pipeline_id:
+            try:
+                # Only pass the data part, not the entire update object
+                await log_agent_activity(
+                    self.current_pipeline_id, 
+                    agent_name, 
+                    message, 
+                    "INFO", 
+                    data  # Pass only the data dict, not the entire update
+                )
+            except Exception as e:
+                print(f"Database logging error: {e}")
 
     async def fetch_news(self) -> List[Dict]:
         """Agent 1: Fetch news from multiple sources"""
@@ -55,7 +81,7 @@ class NewsAgent:
                 # Parse RSS feed
                 feed = feedparser.parse(source_url)
                 
-                for entry in feed.entries[:5]:  # Limit to 5 articles per source
+                for entry in feed.entries[:3]:  # Limit to 3 articles per source for demo
                     article = {
                         "title": entry.get("title", ""),
                         "summary": entry.get("summary", ""),
@@ -67,7 +93,8 @@ class NewsAgent:
                     
                     # Try to get full content
                     try:
-                        async with aiohttp.ClientSession() as session:
+                        timeout = aiohttp.ClientTimeout(total=10)
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
                             async with session.get(article["link"]) as response:
                                 if response.status == 200:
                                     html = await response.text()
@@ -84,10 +111,11 @@ class NewsAgent:
                                     article["content"] = ' '.join(chunk for chunk in chunks if chunk)[:2000]
                     except Exception as e:
                         await self.send_update("News Fetcher", f"Error fetching content for {article['title']}: {str(e)}")
+                        article["content"] = article["summary"]  # Fallback to summary
                     
                     all_articles.append(article)
                 
-                await self.send_update("News Fetcher", f"Fetched {len(feed.entries[:5])} articles from {source_url}")
+                await self.send_update("News Fetcher", f"Fetched {len(feed.entries[:3])} articles from {source_url}")
                 
             except Exception as e:
                 await self.send_update("News Fetcher", f"Error fetching from {source_url}: {str(e)}")
@@ -122,25 +150,38 @@ class NewsAgent:
                 Legitimate: Yes/No
                 """
                 
-                response = await self.llm.ainvoke([HumanMessage(content=authenticity_prompt)])
-                
-                # Try to find similar news from other sources
-                similar_articles = await self.find_similar_news(article['title'])
-                
-                article['authenticity_check'] = {
-                    "analysis": response.content,
-                    "similar_articles_count": len(similar_articles),
-                    "similar_articles": similar_articles
-                }
+                try:
+                    response = await self.llm.ainvoke([HumanMessage(content=authenticity_prompt)])
+                    
+                    # Try to find similar news from other sources
+                    similar_articles = await self.find_similar_news(article['title'])
+                    
+                    article['authenticity_check'] = {
+                        "analysis": response.content,
+                        "similar_articles_count": len(similar_articles),
+                        "similar_articles": similar_articles,
+                        "verified_at": datetime.now().isoformat()
+                    }
+                    
+                except Exception as llm_error:
+                    await self.send_update("Authenticity Checker", f"LLM error for article: {str(llm_error)}")
+                    article['authenticity_check'] = {
+                        "analysis": "Error during analysis",
+                        "similar_articles_count": 0,
+                        "similar_articles": [],
+                        "error": str(llm_error)
+                    }
                 
                 verified_articles.append(article)
                 
                 await self.send_update("Authenticity Checker", 
                                      f"Verified: {article['title'][:50]}...", 
-                                     {"similar_found": len(similar_articles)})
+                                     {"similar_found": len(article['authenticity_check']['similar_articles'])})
                 
             except Exception as e:
                 await self.send_update("Authenticity Checker", f"Error verifying article: {str(e)}")
+                article['authenticity_check'] = {"error": str(e)}
+                verified_articles.append(article)
         
         await self.send_update("Authenticity Checker", f"Authenticity check completed for {len(verified_articles)} articles")
         return verified_articles
@@ -151,14 +192,6 @@ class NewsAgent:
             # Simple search using title keywords
             search_terms = title.split()[:3]  # Take first 3 words
             search_query = " ".join(search_terms)
-            
-            similar_articles = []
-            
-            # Search in a few news APIs (simplified version)
-            # In production, you'd use proper news APIs like NewsAPI
-            search_urls = [
-                f"https://www.google.com/search?q={search_query}+news&tbm=nws",
-            ]
             
             # For demo, return mock similar articles
             similar_articles = [
@@ -201,18 +234,21 @@ class NewsAgent:
                 Content: [Unbiased content]
                 """
                 
-                response = await self.llm.ainvoke([HumanMessage(content=bias_removal_prompt)])
+                try:
+                    response = await self.llm.ainvoke([HumanMessage(content=bias_removal_prompt)])
+                    article['unbiased_version'] = response.content
+                except Exception as llm_error:
+                    await self.send_update("Bias Remover", f"LLM error: {str(llm_error)}")
+                    article['unbiased_version'] = article['content']  # Fallback to original
                 
-                # Parse the response to extract title and content
-                unbiased_content = response.content
-                
-                article['unbiased_version'] = unbiased_content
                 unbiased_articles.append(article)
                 
                 await self.send_update("Bias Remover", f"Processed: {article['title'][:50]}...")
                 
             except Exception as e:
                 await self.send_update("Bias Remover", f"Error removing bias: {str(e)}")
+                article['unbiased_version'] = article['content']  # Fallback to original
+                unbiased_articles.append(article)
         
         await self.send_update("Bias Remover", f"Bias removal completed for {len(unbiased_articles)} articles")
         return unbiased_articles
@@ -248,26 +284,39 @@ class NewsAgent:
                 TAGS: [Relevant tags separated by commas]
                 """
                 
-                response = await self.llm.ainvoke([HumanMessage(content=article_generation_prompt)])
+                try:
+                    response = await self.llm.ainvoke([HumanMessage(content=article_generation_prompt)])
+                    generated_content = response.content
+                except Exception as llm_error:
+                    await self.send_update("Article Generator", f"LLM error: {str(llm_error)}")
+                    generated_content = f"HEADLINE: {article['title']}\nLEAD: {article['content'][:200]}...\nBODY: Content generation failed\nTAGS: news, error"
                 
-                # Parse the generated article
-                generated_content = response.content
+                # Save to database using the database function
+                article_id = await save_article_to_db(
+                    pipeline_id=self.current_pipeline_id,
+                    original_title=article['title'],
+                    original_link=article['link'],
+                    generated_content=generated_content,
+                    authenticity_score=article.get('authenticity_check', {}),
+                    source=article['source'],
+                    cycle_number=self.current_cycle
+                )
                 
                 # Create final article object
                 final_article = {
+                    "id": article_id,
                     "original_title": article['title'],
                     "original_link": article['link'],
                     "generated_content": generated_content,
                     "authenticity_score": article.get('authenticity_check', {}),
                     "processed_at": datetime.now().isoformat(),
-                    "source": article['source']
+                    "source": article['source'],
+                    "pipeline_id": self.current_pipeline_id,
+                    "cycle_number": self.current_cycle
                 }
                 
-                # Save to database
-                article_id = await self.save_article_to_db(final_article)
-                final_article['id'] = article_id
-                
                 final_articles.append(final_article)
+                self.total_articles_processed += 1
                 
                 await self.send_update("Article Generator", 
                                      f"Generated and saved: {article['title'][:50]}...", 
@@ -279,52 +328,42 @@ class NewsAgent:
         await self.send_update("Article Generator", f"Article generation completed. {len(final_articles)} articles saved to database")
         return final_articles
 
-    async def save_article_to_db(self, article: Dict) -> int:
-        """Save generated article to database"""
-        async with get_db_connection() as conn:
-            # Ensure articles table exists
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS articles (
-                    id SERIAL PRIMARY KEY,
-                    original_title TEXT NOT NULL,
-                    original_link TEXT,
-                    generated_content TEXT NOT NULL,
-                    authenticity_score JSONB,
-                    source TEXT,
-                    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            article_id = await conn.fetchval("""
-                INSERT INTO articles (original_title, original_link, generated_content, authenticity_score, source, processed_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id
-            """, 
-            article['original_title'],
-            article['original_link'],
-            article['generated_content'],
-            json.dumps(article['authenticity_score']),
-            article['source'],
-            datetime.fromisoformat(article['processed_at'])
-            )
-            
-            return article_id
-
     async def run_pipeline(self, duration_minutes: int = 30):
         """Run the complete news processing pipeline"""
         if self.is_running:
             await self.send_update("Pipeline", "Pipeline is already running!")
             return
         
+        # Initialize pipeline
         self.is_running = True
-        start_time = datetime.now()
+        self.current_pipeline_id = str(uuid.uuid4())
+        self.start_time = datetime.now()
+        self.current_cycle = 0
+        self.total_articles_processed = 0
+        
+        # Create pipeline run record
+        try:
+            await create_pipeline_run(self.current_pipeline_id, duration_minutes)
+        except Exception as e:
+            await self.send_update("Pipeline", f"Error creating pipeline record: {str(e)}")
         
         try:
-            await self.send_update("Pipeline", f"Starting news processing pipeline for {duration_minutes} minutes...")
+            await self.send_update("Pipeline", f"Starting news processing pipeline for {duration_minutes} minutes...", {
+                "pipeline_id": self.current_pipeline_id,
+                "duration_minutes": duration_minutes,
+                "start_time": self.start_time.isoformat()
+            })
             
-            while self.is_running and (datetime.now() - start_time).seconds < duration_minutes * 60:
+            end_time = self.start_time + timedelta(minutes=duration_minutes)
+            
+            while self.is_running and datetime.now() < end_time:
+                self.current_cycle += 1
                 cycle_start = datetime.now()
+                
+                await self.send_update("Pipeline", f"Starting cycle {self.current_cycle}...", {
+                    "cycle": self.current_cycle,
+                    "time_remaining": str(end_time - datetime.now())
+                })
                 
                 # Step 1: Fetch news
                 articles = await self.fetch_news()
@@ -339,20 +378,67 @@ class NewsAgent:
                     # Step 4: Generate and save articles
                     final_articles = await self.generate_articles(unbiased_articles)
                     
+                    # Update progress
+                    try:
+                        await update_pipeline_progress(self.current_pipeline_id, self.current_cycle, self.total_articles_processed)
+                    except Exception as e:
+                        await self.send_update("Pipeline", f"Error updating progress: {str(e)}")
+                    
                     cycle_time = (datetime.now() - cycle_start).seconds
                     await self.send_update("Pipeline", 
-                                         f"Cycle completed in {cycle_time}s. Processed {len(final_articles)} articles")
+                                         f"Cycle {self.current_cycle} completed in {cycle_time}s. Processed {len(final_articles)} articles", {
+                                             "cycle": self.current_cycle,
+                                             "articles_in_cycle": len(final_articles),
+                                             "total_articles": self.total_articles_processed,
+                                             "cycle_duration": cycle_time
+                                         })
+                else:
+                    await self.send_update("Pipeline", f"No articles fetched in cycle {self.current_cycle}")
                 
-                # Wait before next cycle (5 minutes)
-                await asyncio.sleep(300)
+                # Wait before next cycle (5 minutes) or check if time is up
+                remaining_time = (end_time - datetime.now()).total_seconds()
+                if remaining_time > 300:  # More than 5 minutes left
+                    await asyncio.sleep(300)  # Wait 5 minutes
+                elif remaining_time > 0:
+                    await asyncio.sleep(remaining_time)  # Wait remaining time
+                else:
+                    break  # Time is up
             
-            await self.send_update("Pipeline", "News processing pipeline completed successfully!")
+            # Pipeline completed
+            await update_pipeline_status(self.current_pipeline_id, "COMPLETED")
+            await self.send_update("Pipeline", f"News processing pipeline completed successfully! Processed {self.total_articles_processed} articles in {self.current_cycle} cycles.", {
+                "status": "COMPLETED",
+                "total_articles": self.total_articles_processed,
+                "total_cycles": self.current_cycle,
+                "duration": str(datetime.now() - self.start_time)
+            })
             
         except Exception as e:
-            await self.send_update("Pipeline", f"Pipeline error: {str(e)}")
+            await update_pipeline_status(self.current_pipeline_id, "ERROR", str(e))
+            await self.send_update("Pipeline", f"Pipeline error: {str(e)}", {"status": "ERROR", "error": str(e)})
         finally:
             self.is_running = False
+            self.current_pipeline_id = None
 
     def stop_pipeline(self):
         """Stop the running pipeline"""
-        self.is_running = False
+        if self.is_running and self.current_pipeline_id:
+            self.is_running = False
+            # Update database status will be handled by the main loop
+            asyncio.create_task(self._stop_pipeline_cleanup())
+
+    async def _stop_pipeline_cleanup(self):
+        """Cleanup after stopping pipeline"""
+        if self.current_pipeline_id:
+            await update_pipeline_status(self.current_pipeline_id, "STOPPED")
+            await self.send_update("Pipeline", "Pipeline stopped by user", {"status": "STOPPED"})
+
+    def get_status(self):
+        """Get current pipeline status"""
+        return {
+            "is_running": self.is_running,
+            "pipeline_id": self.current_pipeline_id,
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+            "current_cycle": self.current_cycle,
+            "total_articles_processed": self.total_articles_processed
+        }

@@ -7,7 +7,10 @@ class PipelineStartRequest(BaseModel):
 
 class PipelineStatusResponse(BaseModel):
     is_running: bool
+    pipeline_id: Optional[str] = None
     start_time: Optional[datetime] = None
+    current_cycle: Optional[int] = None
+    total_articles_processed: Optional[int] = None
     duration_minutes: Optional[int] = None
 
 class PipelineRunResponse(BaseModel):
@@ -20,14 +23,16 @@ class PipelineRunResponse(BaseModel):
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
-    auto_mode: bool
     duration_minutes: int
 
 class AgentUpdateResponse(BaseModel):
     agent: str
     message: str
     timestamp: str
+    pipeline_id: Optional[str] = None
+    cycle: Optional[int] = None
     data: Optional[Dict[str, Any]] = None
 
 class AgentLogResponse(BaseModel):
@@ -56,5 +61,5 @@ class AdminDashboardStats(BaseModel):
     articles_today: int
     pipeline_running: bool
     active_connections: int
-    running_pipelines: int
-    recent_activity: Dict[str, int]
+    running_pipelines: int = 0
+    recent_activity: Optional[Dict[str, int]] = None

@@ -1,16 +1,17 @@
-from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import timedelta
 from contextlib import asynccontextmanager
 import os
 import json
+import asyncio
 from schemas import (
     UserCreate, UserResponse, User, Token, LoginRequest, 
     AdminUserCreate, AdminLoginRequest, UserUpdate
 )
 from admin_schemas import (
     PipelineStartRequest, PipelineStatusResponse, 
-    ArticleResponse, AdminDashboardStats
+    ArticleResponse, AdminDashboardStats, PipelineRunResponse
 )
 from auth import (
     get_password_hash, authenticate_user, authenticate_admin, create_access_token,
@@ -19,13 +20,14 @@ from auth import (
 from database import (
     create_connection_pool, close_connection_pool, init_database,
     create_user, get_user_by_email, get_all_users, update_user_activity,
-    get_db_connection
+    get_db_connection, get_active_pipeline_runs, get_articles, get_dashboard_stats
 )
 from agents import NewsAgent
 from websocket_manager import manager
 
 # Global variables
 news_agent = None
+background_tasks = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -45,6 +47,12 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if news_agent and news_agent.is_running:
         news_agent.stop_pipeline()
+    
+    # Cancel all background tasks
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
+    
     await close_connection_pool()
 
 app = FastAPI(
@@ -63,6 +71,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def create_background_task(coro):
+    """Create and track background tasks"""
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
 @app.get("/")
 def read_root():
     """Root endpoint."""
@@ -78,12 +93,35 @@ def health_check():
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
+        # Send initial connection message
+        await websocket.send_text(json.dumps({
+            "agent": "System",
+            "message": "Connected to AIC News Agency real-time updates",
+            "timestamp": "now",
+            "data": {"connected": True}
+        }))
+        
         while True:
             # Keep connection alive and handle any incoming messages
-            data = await websocket.receive_text()
-            # Echo back for testing
-            await websocket.send_text(f"Echo: {data}")
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                # Echo back for testing
+                await websocket.send_text(json.dumps({
+                    "agent": "Echo",
+                    "message": f"Received: {data}",
+                    "timestamp": "now"
+                }))
+            except asyncio.TimeoutError:
+                # Send ping to keep connection alive
+                await websocket.send_text(json.dumps({
+                    "agent": "System",
+                    "message": "ping",
+                    "timestamp": "now"
+                }))
     except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
         manager.disconnect(websocket)
 
 # User Registration and Authentication
@@ -258,10 +296,13 @@ async def start_pipeline(
         )
     
     # Start pipeline in background
-    import asyncio
-    asyncio.create_task(news_agent.run_pipeline(request.duration_minutes))
+    task = create_background_task(news_agent.run_pipeline(request.duration_minutes))
     
-    return {"message": f"Pipeline started for {request.duration_minutes} minutes"}
+    return {
+        "message": f"Pipeline started for {request.duration_minutes} minutes",
+        "pipeline_id": news_agent.current_pipeline_id,
+        "duration_minutes": request.duration_minutes
+    }
 
 @app.post("/admin/pipeline/stop")
 async def stop_pipeline(current_admin: User = Depends(get_current_admin_user)):
@@ -272,8 +313,14 @@ async def stop_pipeline(current_admin: User = Depends(get_current_admin_user)):
             detail="News agent not initialized"
         )
     
+    if not news_agent.is_running:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pipeline is currently running"
+        )
+    
     news_agent.stop_pipeline()
-    return {"message": "Pipeline stopped"}
+    return {"message": "Pipeline stop requested"}
 
 @app.get("/admin/pipeline/status", response_model=PipelineStatusResponse)
 async def get_pipeline_status(current_admin: User = Depends(get_current_admin_user)):
@@ -281,83 +328,86 @@ async def get_pipeline_status(current_admin: User = Depends(get_current_admin_us
     if not news_agent:
         return PipelineStatusResponse(is_running=False)
     
-    return PipelineStatusResponse(is_running=news_agent.is_running)
+    status = news_agent.get_status()
+    return PipelineStatusResponse(
+        is_running=status["is_running"],
+        pipeline_id=status["pipeline_id"],
+        start_time=status["start_time"],
+        current_cycle=status["current_cycle"],
+        total_articles_processed=status["total_articles_processed"]
+    )
 
-@app.get("/admin/articles", response_model=list[ArticleResponse])
-async def get_articles(
-    limit: int = 50,
+@app.get("/admin/pipeline/runs", response_model=list[PipelineRunResponse])
+async def get_pipeline_runs(
+    limit: int = 10,
     current_admin: User = Depends(get_current_admin_user)
 ):
-    """Get processed articles. (Admin only)"""
+    """Get pipeline run history. (Admin only)"""
     async with get_db_connection() as conn:
-        # Ensure articles table exists
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS articles (
-                id SERIAL PRIMARY KEY,
-                original_title TEXT NOT NULL,
-                original_link TEXT,
-                generated_content TEXT NOT NULL,
-                authenticity_score JSONB,
-                source TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        articles = await conn.fetch("""
-            SELECT id, original_title, original_link, generated_content, 
-                   authenticity_score, source, processed_at, created_at
-            FROM articles 
+        runs = await conn.fetch("""
+            SELECT id, pipeline_id, status, current_cycle, total_cycles, 
+                   articles_processed, error_message, created_at, updated_at, 
+                   started_at, ended_at, duration_minutes
+            FROM pipeline_runs 
             ORDER BY created_at DESC 
             LIMIT $1
         """, limit)
         
         return [
-            ArticleResponse(
-                id=article['id'],
-                original_title=article['original_title'],
-                original_link=article['original_link'],
-                generated_content=article['generated_content'],
-                authenticity_score=json.loads(article['authenticity_score']) if article['authenticity_score'] else {},
-                source=article['source'],
-                processed_at=article['processed_at'],
-                created_at=article['created_at']
+            PipelineRunResponse(
+                id=run['id'],
+                pipeline_id=run['pipeline_id'],
+                status=run['status'],
+                current_cycle=run['current_cycle'],
+                total_cycles=run['total_cycles'],
+                articles_processed=run['articles_processed'],
+                error_message=run['error_message'],
+                created_at=run['created_at'],
+                updated_at=run['updated_at'],
+                started_at=run['started_at'],
+                ended_at=run['ended_at'],
+                duration_minutes=run['duration_minutes']
             )
-            for article in articles
+            for run in runs
         ]
 
+@app.get("/admin/articles", response_model=list[ArticleResponse])
+async def get_articles_endpoint(
+    limit: int = 50,
+    pipeline_id: str = None,
+    current_admin: User = Depends(get_current_admin_user)
+):
+    """Get processed articles. (Admin only)"""
+    articles = await get_articles(limit, pipeline_id)
+    
+    return [
+        ArticleResponse(
+            id=article['id'],
+            original_title=article['original_title'],
+            original_link=article['original_link'],
+            generated_content=article['generated_content'],
+            authenticity_score=json.loads(article['authenticity_score']) if article['authenticity_score'] else {},
+            source=article['source'],
+            processed_at=article['processed_at'],
+            created_at=article['created_at'],
+            pipeline_id=article['pipeline_id'],
+            cycle_number=article['cycle_number']
+        )
+        for article in articles
+    ]
+
 @app.get("/admin/dashboard/stats", response_model=AdminDashboardStats)
-async def get_dashboard_stats(current_admin: User = Depends(get_current_admin_user)):
+async def get_dashboard_stats_endpoint(current_admin: User = Depends(get_current_admin_user)):
     """Get dashboard statistics. (Admin only)"""
-    async with get_db_connection() as conn:
-        # Ensure articles table exists
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS articles (
-                id SERIAL PRIMARY KEY,
-                original_title TEXT NOT NULL,
-                original_link TEXT,
-                generated_content TEXT NOT NULL,
-                authenticity_score JSONB,
-                source TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Get total articles
-        total_articles = await conn.fetchval("SELECT COUNT(*) FROM articles")
-        
-        # Get articles today
-        articles_today = await conn.fetchval("""
-            SELECT COUNT(*) FROM articles 
-            WHERE DATE(created_at) = CURRENT_DATE
-        """)
+    stats = await get_dashboard_stats()
     
     return AdminDashboardStats(
-        total_articles=total_articles or 0,
-        articles_today=articles_today or 0,
+        total_articles=stats["total_articles"],
+        articles_today=stats["articles_today"],
         pipeline_running=news_agent.is_running if news_agent else False,
-        active_connections=len(manager.active_connections)
+        active_connections=len(manager.active_connections),
+        running_pipelines=stats["running_pipelines"],
+        recent_activity={"articles_today": stats["articles_today"], "total_articles": stats["total_articles"]}
     )
 
 @app.get("/admin/protected")
