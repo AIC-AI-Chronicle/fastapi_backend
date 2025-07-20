@@ -391,6 +391,7 @@ async def get_articles_endpoint(
             id=article['id'],
             original_title=article['original_title'],
             original_link=article['original_link'],
+            image_url=article.get('image_url'),
             generated_content=article['generated_content'],
             authenticity_score=json.loads(article['authenticity_score']) if article['authenticity_score'] else {},
             source=article['source'],
@@ -535,6 +536,7 @@ async def get_user_articles_endpoint(
                 id=article["id"],
                 title=title or "Untitled",
                 content=content,
+                image_url=article.get("image_url"),
                 source=article.get("source", "Unknown"),
                 published_at=published_at,
                 relevance_score=relevance_score,
@@ -621,7 +623,6 @@ async def search_user_articles(
                         elif line.startswith("TAGS:"):
                             tags_str = line.replace("TAGS:", "").strip()
                             tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
-                            break
             except Exception:
                 pass
             
@@ -634,6 +635,7 @@ async def search_user_articles(
                 id=article["id"],
                 title=title or "Untitled",
                 content=content,
+                image_url=article.get("image_url"),
                 source=article.get("source", "Unknown"),
                 published_at=published_at,
                 relevance_score=article.get("relevance_score", 0.0),

@@ -48,6 +48,7 @@ class ArticleResponse(BaseModel):
     id: int
     original_title: str
     original_link: str
+    image_url: Optional[str] = None
     generated_content: str
     authenticity_score: Dict[str, Any]
     source: str

@@ -28,6 +28,7 @@ class UserArticleResponse(BaseModel):
     id: int
     title: str
     content: str
+    image_url: Optional[str] = None
     source: str
     published_at: datetime
     relevance_score: Optional[float] = None

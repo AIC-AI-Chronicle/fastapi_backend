@@ -59,12 +59,13 @@ async def init_database():
             )
         """)
         
-        # Create articles table with blockchain fields
+        # Create articles table with blockchain fields and image_url
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS articles (
                 id SERIAL PRIMARY KEY,
                 original_title TEXT NOT NULL,
                 original_link TEXT,
+                image_url TEXT,
                 generated_content TEXT NOT NULL,
                 authenticity_score JSONB,
                 source TEXT,
@@ -237,16 +238,18 @@ async def get_active_pipeline_runs():
         return [dict(record) for record in records]
 
 async def save_article_to_db(pipeline_id: str, original_title: str, original_link: str, 
-                           generated_content: str, authenticity_score: dict, source: str, cycle_number: int) -> int:
+                           image_url: str, generated_content: str, authenticity_score: dict, 
+                           source: str, cycle_number: int) -> int:
     """Save generated article to database"""
     async with get_db_connection() as conn:
         article_id = await conn.fetchval("""
-            INSERT INTO articles (original_title, original_link, generated_content, authenticity_score, source, pipeline_id, cycle_number)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
+            INSERT INTO articles (original_title, original_link, image_url, generated_content, authenticity_score, source, pipeline_id, cycle_number)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
             RETURNING id
         """, 
         original_title,
         original_link,
+        image_url,
         generated_content,
         json.dumps(authenticity_score) if authenticity_score else None,
         source,
@@ -285,7 +288,7 @@ async def get_articles(limit: int = 50, pipeline_id: str = None):
     async with get_db_connection() as conn:
         if pipeline_id:
             articles = await conn.fetch("""
-                SELECT id, original_title, original_link, generated_content, 
+                SELECT id, original_title, original_link, image_url, generated_content, 
                        authenticity_score, source, processed_at, created_at, pipeline_id, cycle_number,
                        blockchain_stored, blockchain_transaction_hash, blockchain_article_id,
                        blockchain_network, blockchain_explorer_url, content_hash, metadata_hash
@@ -296,7 +299,7 @@ async def get_articles(limit: int = 50, pipeline_id: str = None):
             """, pipeline_id, limit)
         else:
             articles = await conn.fetch("""
-                SELECT id, original_title, original_link, generated_content, 
+                SELECT id, original_title, original_link, image_url, generated_content, 
                        authenticity_score, source, processed_at, created_at, pipeline_id, cycle_number,
                        blockchain_stored, blockchain_transaction_hash, blockchain_article_id,
                        blockchain_network, blockchain_explorer_url, content_hash, metadata_hash
@@ -365,7 +368,7 @@ async def search_articles_by_keywords(keywords: List[str], limit: int = 50):
         params.append(limit)
         
         query = f"""
-            SELECT id, original_title, generated_content, source, created_at,
+            SELECT id, original_title, image_url, generated_content, source, created_at,
                    blockchain_stored, blockchain_explorer_url, blockchain_transaction_hash,
                    1.0 as relevance_score
             FROM articles 
@@ -439,9 +442,9 @@ async def get_user_articles(interests: List[str] = None, page: int = 1, page_siz
         limit_param = f"${len(params) + 1}"
         offset_param = f"${len(params) + 2}"
         
-        # Get articles with pagination including blockchain info
+        # Get articles with pagination including blockchain info and image_url
         articles_query = f"""
-            SELECT id, original_title, generated_content, source, created_at, processed_at,
+            SELECT id, original_title, image_url, generated_content, source, created_at, processed_at,
                    blockchain_stored, blockchain_transaction_hash, blockchain_article_id,
                    blockchain_network, blockchain_explorer_url, content_hash, metadata_hash
             FROM articles 

@@ -84,16 +84,31 @@ class NewsAgent:
                 feed = feedparser.parse(source_url)
                 
                 for entry in feed.entries[:3]:  # Limit to 3 articles per source for demo
+                    # Extract image URL from RSS entry
+                    image_url = None
+                    
+                    # Try different ways to get image URL from RSS
+                    if hasattr(entry, 'media_content') and entry.media_content:
+                        image_url = entry.media_content[0].get('url')
+                    elif hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+                        image_url = entry.media_thumbnail[0].get('url')
+                    elif hasattr(entry, 'enclosures') and entry.enclosures:
+                        for enclosure in entry.enclosures:
+                            if enclosure.type and 'image' in enclosure.type:
+                                image_url = enclosure.href
+                                break
+                    
                     article = {
                         "title": entry.get("title", ""),
                         "summary": entry.get("summary", ""),
                         "link": entry.get("link", ""),
+                        "image_url": image_url,
                         "published": entry.get("published", ""),
                         "source": source_url,
                         "content": ""
                     }
                     
-                    # Try to get full content
+                    # Try to get full content and extract image if not found in RSS
                     try:
                         timeout = aiohttp.ClientTimeout(total=10)
                         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -101,6 +116,31 @@ class NewsAgent:
                                 if response.status == 200:
                                     html = await response.text()
                                     soup = BeautifulSoup(html, 'html.parser')
+                                    
+                                    # Extract image URL if not found in RSS
+                                    if not image_url:
+                                        # Try to find Open Graph image
+                                        og_image = soup.find('meta', property='og:image')
+                                        if og_image and og_image.get('content'):
+                                            article["image_url"] = og_image.get('content')
+                                        else:
+                                            # Try to find Twitter card image
+                                            twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
+                                            if twitter_image and twitter_image.get('content'):
+                                                article["image_url"] = twitter_image.get('content')
+                                            else:
+                                                # Try to find first img tag in content
+                                                first_img = soup.find('img')
+                                                if first_img and first_img.get('src'):
+                                                    src = first_img.get('src')
+                                                    # Make sure it's a full URL
+                                                    if src.startswith('//'):
+                                                        article["image_url"] = 'https:' + src
+                                                    elif src.startswith('/'):
+                                                        from urllib.parse import urljoin
+                                                        article["image_url"] = urljoin(article["link"], src)
+                                                    elif src.startswith('http'):
+                                                        article["image_url"] = src
                                     
                                     # Remove script and style elements
                                     for script in soup(["script", "style"]):
@@ -293,11 +333,12 @@ class NewsAgent:
                     await self.send_update("Article Generator", f"LLM error: {str(llm_error)}")
                     generated_content = f"HEADLINE: {article['title']}\nLEAD: {article['content'][:200]}...\nBODY: Content generation failed\nTAGS: news, error"
                 
-                # Save to database using the database function
+                # Save to database using the database function (now includes image_url)
                 article_id = await save_article_to_db(
                     pipeline_id=self.current_pipeline_id,
                     original_title=article['title'],
                     original_link=article['link'],
+                    image_url=article.get('image_url'),
                     generated_content=generated_content,
                     authenticity_score=article.get('authenticity_check', {}),
                     source=article['source'],
@@ -309,6 +350,7 @@ class NewsAgent:
                     "id": article_id,
                     "original_title": article['title'],
                     "original_link": article['link'],
+                    "image_url": article.get('image_url'),
                     "generated_content": generated_content,
                     "authenticity_score": article.get('authenticity_check', {}),
                     "processed_at": datetime.now().isoformat(),
@@ -322,7 +364,7 @@ class NewsAgent:
                 
                 await self.send_update("Article Generator", 
                                      f"Generated and saved: {article['title'][:50]}...", 
-                                     {"article_id": article_id})
+                                     {"article_id": article_id, "has_image": bool(article.get('image_url'))})
                 
             except Exception as e:
                 await self.send_update("Article Generator", f"Error generating article: {str(e)}")
