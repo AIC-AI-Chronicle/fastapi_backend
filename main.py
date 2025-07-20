@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import os
 import json
 import asyncio
+import math
 from schemas import (
     UserCreate, UserResponse, User, Token, LoginRequest, 
     AdminUserCreate, AdminLoginRequest, UserUpdate
@@ -26,8 +27,9 @@ from database import (
 from agents import NewsAgent
 from websocket_manager import manager
 from user_schemas import (
-    UserArticleRequest, UserArticleResponse, UserArticlesPageResponse
+    BlockchainInfo, UserArticleRequest, UserArticleResponse, UserArticlesPageResponse
 )
+from blockchain_integration import BlockchainHasher
 
 # Global variables
 news_agent = None
@@ -475,6 +477,8 @@ async def get_user_articles_endpoint(
         
         # Process articles and extract titles/tags from generated content
         user_articles = []
+        blockchain_stored_count = 0
+        
         for article in result["articles"]:
             # Extract title and content from generated_content
             generated_content = article.get("generated_content", "")
@@ -513,6 +517,20 @@ async def get_user_articles_endpoint(
             if published_at and published_at.tzinfo is None:
                 published_at = published_at.replace(tzinfo=timezone.utc)
             
+            # Create blockchain info
+            blockchain_info = None
+            if article.get("blockchain_stored"):
+                blockchain_stored_count += 1
+                blockchain_info = BlockchainInfo(
+                    stored_on_chain=article.get("blockchain_stored", False),
+                    transaction_hash=article.get("blockchain_transaction_hash"),
+                    blockchain_article_id=article.get("blockchain_article_id"),
+                    network=article.get("blockchain_network", "bsc_testnet"),
+                    explorer_url=article.get("blockchain_explorer_url"),
+                    content_hash=article.get("content_hash"),
+                    metadata_hash=article.get("metadata_hash")
+                )
+            
             user_articles.append(UserArticleResponse(
                 id=article["id"],
                 title=title or "Untitled",
@@ -520,7 +538,8 @@ async def get_user_articles_endpoint(
                 source=article.get("source", "Unknown"),
                 published_at=published_at,
                 relevance_score=relevance_score,
-                tags=tags
+                tags=tags,
+                blockchain_info=blockchain_info
             ))
         
         # Sort by relevance if interests provided
@@ -532,6 +551,15 @@ async def get_user_articles_endpoint(
         has_next = request.page < total_pages
         has_previous = request.page > 1
         
+        # Blockchain statistics
+        blockchain_stats = {
+            "total_articles_on_page": len(user_articles),
+            "blockchain_stored_count": blockchain_stored_count,
+            "blockchain_stored_percentage": (blockchain_stored_count / len(user_articles) * 100) if user_articles else 0,
+            "network": "bsc_testnet",
+            "explorer_base_url": "https://testnet.bscscan.com"
+        }
+        
         return UserArticlesPageResponse(
             articles=user_articles,
             total_count=result["total_count"],
@@ -539,7 +567,8 @@ async def get_user_articles_endpoint(
             page_size=request.page_size,
             total_pages=total_pages,
             has_next=has_next,
-            has_previous=has_previous
+            has_previous=has_previous,
+            blockchain_statistics=blockchain_stats
         )
     
     except HTTPException:
@@ -686,6 +715,39 @@ async def get_popular_interests(current_user: User = Depends(get_current_active_
             ],
             "total_articles_analyzed": 0,
             "suggestion": "Select interests that match your preferences to get personalized article recommendations"
+        }
+
+@app.get("/blockchain/status")
+async def get_blockchain_status():
+    """Get blockchain connection status and statistics"""
+    try:
+        hasher = BlockchainHasher()
+        status = await hasher.check_blockchain_status()
+        return {
+            "success": True,
+            "blockchain_status": status
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "blockchain_status": {"connected": False}
+        }
+
+@app.get("/blockchain/articles/{article_id}")
+async def get_blockchain_article(article_id: int):
+    """Get article details from blockchain"""
+    try:
+        hasher = BlockchainHasher()
+        article = await hasher.get_blockchain_article(article_id)
+        return {
+            "success": True,
+            "article": article
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
         }
 
 if __name__ == "__main__":

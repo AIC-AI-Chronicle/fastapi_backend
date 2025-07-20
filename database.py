@@ -59,7 +59,7 @@ async def init_database():
             )
         """)
         
-        # Create articles table
+        # Create articles table with blockchain fields
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS articles (
                 id SERIAL PRIMARY KEY,
@@ -71,7 +71,14 @@ async def init_database():
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 pipeline_id VARCHAR(255),
-                cycle_number INTEGER DEFAULT 1
+                cycle_number INTEGER DEFAULT 1,
+                blockchain_stored BOOLEAN DEFAULT FALSE,
+                blockchain_transaction_hash VARCHAR(255),
+                blockchain_article_id INTEGER,
+                blockchain_network VARCHAR(50) DEFAULT 'bsc_testnet',
+                blockchain_explorer_url TEXT,
+                content_hash VARCHAR(255),
+                metadata_hash VARCHAR(255)
             )
         """)
         
@@ -249,13 +256,39 @@ async def save_article_to_db(pipeline_id: str, original_title: str, original_lin
         
         return article_id
 
+async def update_article_blockchain_info(article_id: int, blockchain_info: dict):
+    """Update article with blockchain information"""
+    async with get_db_connection() as conn:
+        await conn.execute("""
+            UPDATE articles 
+            SET blockchain_stored = $2,
+                blockchain_transaction_hash = $3,
+                blockchain_article_id = $4,
+                blockchain_network = $5,
+                blockchain_explorer_url = $6,
+                content_hash = $7,
+                metadata_hash = $8
+            WHERE id = $1
+        """, 
+        article_id,
+        blockchain_info.get('stored_on_chain', False),
+        blockchain_info.get('transaction_hash'),
+        blockchain_info.get('blockchain_article_id'),
+        blockchain_info.get('network', 'bsc_testnet'),
+        blockchain_info.get('explorer_url'),
+        blockchain_info.get('content_hash'),
+        blockchain_info.get('metadata_hash')
+        )
+
 async def get_articles(limit: int = 50, pipeline_id: str = None):
     """Get articles from database"""
     async with get_db_connection() as conn:
         if pipeline_id:
             articles = await conn.fetch("""
                 SELECT id, original_title, original_link, generated_content, 
-                       authenticity_score, source, processed_at, created_at, pipeline_id, cycle_number
+                       authenticity_score, source, processed_at, created_at, pipeline_id, cycle_number,
+                       blockchain_stored, blockchain_transaction_hash, blockchain_article_id,
+                       blockchain_network, blockchain_explorer_url, content_hash, metadata_hash
                 FROM articles 
                 WHERE pipeline_id = $1
                 ORDER BY created_at DESC 
@@ -264,7 +297,9 @@ async def get_articles(limit: int = 50, pipeline_id: str = None):
         else:
             articles = await conn.fetch("""
                 SELECT id, original_title, original_link, generated_content, 
-                       authenticity_score, source, processed_at, created_at, pipeline_id, cycle_number
+                       authenticity_score, source, processed_at, created_at, pipeline_id, cycle_number,
+                       blockchain_stored, blockchain_transaction_hash, blockchain_article_id,
+                       blockchain_network, blockchain_explorer_url, content_hash, metadata_hash
                 FROM articles 
                 ORDER BY created_at DESC 
                 LIMIT $1
@@ -284,6 +319,12 @@ async def get_dashboard_stats():
             WHERE DATE(created_at) = CURRENT_DATE
         """) or 0
         
+        # Get blockchain stored articles
+        blockchain_articles = await conn.fetchval("""
+            SELECT COUNT(*) FROM articles 
+            WHERE blockchain_stored = true
+        """) or 0
+        
         # Get running pipelines count
         running_pipelines = await conn.fetchval("""
             SELECT COUNT(*) FROM pipeline_runs 
@@ -293,6 +334,7 @@ async def get_dashboard_stats():
         return {
             "total_articles": total_articles,
             "articles_today": articles_today,
+            "blockchain_articles": blockchain_articles,
             "running_pipelines": running_pipelines
         }
 
@@ -324,6 +366,7 @@ async def search_articles_by_keywords(keywords: List[str], limit: int = 50):
         
         query = f"""
             SELECT id, original_title, generated_content, source, created_at,
+                   blockchain_stored, blockchain_explorer_url, blockchain_transaction_hash,
                    1.0 as relevance_score
             FROM articles 
             WHERE {' OR '.join(search_conditions)}
@@ -396,9 +439,11 @@ async def get_user_articles(interests: List[str] = None, page: int = 1, page_siz
         limit_param = f"${len(params) + 1}"
         offset_param = f"${len(params) + 2}"
         
-        # Get articles with pagination
+        # Get articles with pagination including blockchain info
         articles_query = f"""
-            SELECT id, original_title, generated_content, source, created_at, processed_at
+            SELECT id, original_title, generated_content, source, created_at, processed_at,
+                   blockchain_stored, blockchain_transaction_hash, blockchain_article_id,
+                   blockchain_network, blockchain_explorer_url, content_hash, metadata_hash
             FROM articles 
             {where_clause}
             ORDER BY created_at DESC 

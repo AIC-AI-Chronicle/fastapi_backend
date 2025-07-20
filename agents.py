@@ -14,6 +14,7 @@ from database import (
     get_db_connection, log_agent_activity, create_pipeline_run, 
     update_pipeline_status, update_pipeline_progress, save_article_to_db
 )
+from blockchain_integration import integrate_blockchain_hashing
 
 class NewsAgent:
     def __init__(self, gemini_api_key: str, websocket_manager):
@@ -366,6 +367,13 @@ class NewsAgent:
                     # Step 4: Generate and save articles
                     final_articles = await self.generate_articles(unbiased_articles)
                     
+                    # Step 5: Store articles on blockchain
+                    blockchain_articles = await integrate_blockchain_hashing(
+                        final_articles, 
+                        self.current_pipeline_id, 
+                        self.websocket_manager
+                    )
+                    
                     # Update progress
                     try:
                         await update_pipeline_progress(self.current_pipeline_id, self.current_cycle, self.total_articles_processed)
@@ -373,10 +381,13 @@ class NewsAgent:
                         await self.send_update("Pipeline", f"Error updating progress: {str(e)}")
                     
                     cycle_time = (datetime.now() - cycle_start).seconds
+                    blockchain_stored = sum(1 for article in blockchain_articles if article.get('blockchain_stored', False))
+                    
                     await self.send_update("Pipeline", 
-                                         f"Cycle {self.current_cycle} completed in {cycle_time}s. Processed {len(final_articles)} articles", {
+                                         f"Cycle {self.current_cycle} completed in {cycle_time}s. Processed {len(final_articles)} articles, {blockchain_stored} stored on blockchain", {
                                              "cycle": self.current_cycle,
                                              "articles_in_cycle": len(final_articles),
+                                             "blockchain_stored": blockchain_stored,
                                              "total_articles": self.total_articles_processed,
                                              "cycle_duration": cycle_time
                                          })

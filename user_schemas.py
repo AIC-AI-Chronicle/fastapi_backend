@@ -15,6 +15,15 @@ class UserArticleRequest(BaseModel):
             datetime: lambda v: v.isoformat() if v else None
         }
 
+class BlockchainInfo(BaseModel):
+    stored_on_chain: bool = False
+    transaction_hash: Optional[str] = None
+    blockchain_article_id: Optional[int] = None
+    network: str = "bsc_testnet"
+    explorer_url: Optional[str] = None
+    content_hash: Optional[str] = None
+    metadata_hash: Optional[str] = None
+
 class UserArticleResponse(BaseModel):
     id: int
     title: str
@@ -23,6 +32,7 @@ class UserArticleResponse(BaseModel):
     published_at: datetime
     relevance_score: Optional[float] = None
     tags: Optional[List[str]] = Field(default_factory=list)
+    blockchain_info: Optional[BlockchainInfo] = None
     
     class Config:
         json_encoders = {
@@ -37,6 +47,7 @@ class UserArticlesPageResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+    blockchain_statistics: Optional[Dict[str, Any]] = None
 
 class ArticleSearchResponse(BaseModel):
     articles: List[UserArticleResponse]
