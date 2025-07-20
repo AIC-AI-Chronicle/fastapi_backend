@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI):
     
     # Initialize news agent
     global news_agent
-    gemini_api_key = os.getenv("GEMINI_API_KEY","AIzaSyDPgDccGhgwqqrs2DBgOu-BhbTv4vrho44")
+    gemini_api_key = os.getenv("GEMINI_API_KEY","AIzaSyAdmLL_kfsmECwKuW70gWrjrnXA0WB5ZqY")
     if not gemini_api_key:
         print("Warning: GEMINI_API_KEY not found in environment variables")
     else:

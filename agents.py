@@ -18,7 +18,7 @@ from database import (
 class NewsAgent:
     def __init__(self, gemini_api_key: str, websocket_manager):
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-pro",
+            model="gemini-2.0-flash",
             google_api_key=gemini_api_key,
             temperature=0.3
         )
